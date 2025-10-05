@@ -18,6 +18,17 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+type CountingReader struct {
+	r   io.Reader
+	Pos int64
+}
+
+func (cr *CountingReader) Read(p []byte) (int, error) {
+	n, err := cr.r.Read(p)
+	cr.Pos += int64(n)
+	return n, err
+}
+
 const (
 	maxBlobHeaderSize = 64 * 1024
 
@@ -102,9 +113,23 @@ type pair struct {
 	e error
 }
 
+type resultWithOffset struct {
+	pair   pair
+	offset int64
+}
+
+type workerState struct {
+	firstNodeOffset     int64
+	firstWayOffset      int64
+	firstRelationOffset int64
+	ways                int64
+	nodes               int64
+	relations           int64
+}
+
 // A Decoder reads and decodes OpenStreetMap PBF data from an input stream.
 type Decoder struct {
-	r          io.Reader
+	r          *CountingReader
 	serializer chan pair
 
 	buf *bytes.Buffer
@@ -115,18 +140,33 @@ type Decoder struct {
 	headerOnce sync.Once
 
 	// for data decoders
-	inputs  []chan<- pair
+	inputs  []chan<- resultWithOffset
 	outputs []<-chan pair
+
+	firstNodeOffset     int64
+	firstWayOffset      int64
+	firstRelationOffset int64
+	mu                  sync.Mutex
+	validateHeader      bool
+
+	workerStates []*workerState
 }
 
 // NewDecoder returns a new decoder that reads from r.
 func NewDecoder(r io.Reader) *Decoder {
+	cr := &CountingReader{r: r}
 	d := &Decoder{
-		r:          r,
-		serializer: make(chan pair, 8000), // typical PrimitiveBlock contains 8k OSM entities
+		r:              cr,
+		serializer:     make(chan pair, 8000), // typical PrimitiveBlock contains 8k OSM entities
+		validateHeader: true,
 	}
 	d.SetBufferSize(initialBlobBufSize)
 	return d
+}
+
+func (dec *Decoder) WithValidateHeader(b bool) *Decoder {
+	dec.validateHeader = b
+	return dec
 }
 
 // SetBufferSize sets initial size of decoding buffer. Default value is 1MB, you can set higher value
@@ -148,24 +188,51 @@ func (dec *Decoder) Start(n int) error {
 		n = 1
 	}
 
-	if err := dec.readOSMHeader(); err != nil {
-		return err
+	if dec.validateHeader {
+		if err := dec.readOSMHeader(); err != nil {
+			return err
+		}
 	}
+
+	dec.workerStates = make([]*workerState, 0, n)
 
 	// start data decoders
 	for i := 0; i < n; i++ {
-		input := make(chan pair)
+		input := make(chan resultWithOffset)
 		output := make(chan pair)
+
+		workerState := &workerState{}
+		dec.workerStates = append(dec.workerStates, workerState)
+
 		go func() {
 			dd := new(dataDecoder)
 			for p := range input {
-				if p.e == nil {
+				if p.pair.e == nil {
 					// send decoded objects or decoding error
-					objects, err := dd.Decode(p.i.(*OSMPBF.Blob))
+					objects, err := dd.Decode(p.pair.i.(*OSMPBF.Blob))
+					for _, o := range objects {
+						switch o.(type) {
+						case *Node:
+							workerState.nodes++
+							if workerState.firstNodeOffset == 0 || p.offset < workerState.firstNodeOffset {
+								workerState.firstNodeOffset = p.offset
+							}
+						case *Way:
+							workerState.ways++
+							if workerState.firstWayOffset == 0 || p.offset < workerState.firstWayOffset {
+								workerState.firstWayOffset = p.offset
+							}
+						case *Relation:
+							workerState.relations++
+							if workerState.firstRelationOffset == 0 || p.offset < workerState.firstRelationOffset {
+								workerState.firstRelationOffset = p.offset
+							}
+						}
+					}
 					output <- pair{objects, err}
 				} else {
 					// send input error as is
-					output <- pair{nil, p.e}
+					output <- pair{nil, p.pair.e}
 				}
 			}
 			close(output)
@@ -183,15 +250,16 @@ func (dec *Decoder) Start(n int) error {
 			inputIndex = (inputIndex + 1) % n
 
 			blobHeader, blob, err := dec.readFileBlock()
+			pos := dec.r.Pos
 			if err == nil && blobHeader.GetType() != "OSMData" {
 				err = fmt.Errorf("unexpected fileblock of type %s", blobHeader.GetType())
 			}
 			if err == nil {
 				// send blob for decoding
-				input <- pair{blob, nil}
+				input <- resultWithOffset{pair{blob, nil}, pos}
 			} else {
 				// send input error as is
-				input <- pair{nil, err}
+				input <- resultWithOffset{pair{nil, err}, pos}
 				for _, input := range dec.inputs {
 					close(input)
 				}
@@ -393,4 +461,59 @@ func (dec *Decoder) decodeOSMHeader(blob *OSMPBF.Blob) error {
 	dec.header = header
 
 	return nil
+}
+
+// read offsets and counts
+
+func (dec *Decoder) NodeCount() int64 {
+	out := int64(0)
+	for _, state := range dec.workerStates {
+		out += state.nodes
+	}
+	return out
+}
+
+func (dec *Decoder) WayCount() int64 {
+	out := int64(0)
+	for _, state := range dec.workerStates {
+		out += state.ways
+	}
+	return out
+}
+
+func (dec *Decoder) RelationCount() int64 {
+	out := int64(0)
+	for _, state := range dec.workerStates {
+		out += state.relations
+	}
+	return out
+}
+
+func (dec *Decoder) FirstNodeOffset() int64 {
+	out := int64(0)
+	for _, state := range dec.workerStates {
+		if out == 0 || state.firstNodeOffset < out {
+			out = state.firstNodeOffset
+		}
+	}
+	return out
+}
+
+func (dec *Decoder) FirstWayOffset() int64 {
+	out := int64(0)
+	for _, state := range dec.workerStates {
+		if out == 0 || state.firstWayOffset < out {
+			out = state.firstWayOffset
+		}
+	}
+	return out
+}
+func (dec *Decoder) FirstRelationOffset() int64 {
+	out := int64(0)
+	for _, state := range dec.workerStates {
+		if out == 0 || state.firstRelationOffset < out {
+			out = state.firstRelationOffset
+		}
+	}
+	return out
 }
