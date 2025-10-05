@@ -248,9 +248,8 @@ func (dec *Decoder) Start(n int) error {
 		for {
 			input := dec.inputs[inputIndex]
 			inputIndex = (inputIndex + 1) % n
-
-			blobHeader, blob, err := dec.readFileBlock()
 			pos := dec.r.Pos
+			blobHeader, blob, err := dec.readFileBlock()
 			if err == nil && blobHeader.GetType() != "OSMData" {
 				err = fmt.Errorf("unexpected fileblock of type %s", blobHeader.GetType())
 			}
