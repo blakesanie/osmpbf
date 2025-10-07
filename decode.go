@@ -118,13 +118,18 @@ type resultWithOffset struct {
 	offset int64
 }
 
+type PbfIndex struct {
+	FirstNodeOffset     int64
+	FirstWayOffset      int64
+	FirstRelationOffset int64
+	Nodes               int64
+	Ways                int64
+	Relations           int64
+}
+
 type workerState struct {
-	firstNodeOffset     int64
-	firstWayOffset      int64
-	firstRelationOffset int64
-	ways                int64
-	nodes               int64
-	relations           int64
+	PbfIndex
+	processor OsmRawProcessor
 }
 
 // A Decoder reads and decodes OpenStreetMap PBF data from an input stream.
@@ -143,13 +148,10 @@ type Decoder struct {
 	inputs  []chan<- resultWithOffset
 	outputs []<-chan pair
 
-	firstNodeOffset     int64
-	firstWayOffset      int64
-	firstRelationOffset int64
-	mu                  sync.Mutex
-	validateHeader      bool
-
-	workerStates []*workerState
+	validateHeader bool
+	workerStates   []*workerState
+	processors     []OsmRawProcessor
+	wg             sync.WaitGroup
 }
 
 // NewDecoder returns a new decoder that reads from r.
@@ -169,6 +171,11 @@ func (dec *Decoder) WithValidateHeader(b bool) *Decoder {
 	return dec
 }
 
+func (dec *Decoder) WithProcessors(processors []OsmRawProcessor) *Decoder {
+	dec.processors = processors
+	return dec
+}
+
 // SetBufferSize sets initial size of decoding buffer. Default value is 1MB, you can set higher value
 // (for example, MaxBlobSize) for (probably) faster decoding, or lower value for reduced memory consumption.
 // Any value will produce valid results; buffer will grow automatically if required.
@@ -182,9 +189,16 @@ func (dec *Decoder) Header() (*Header, error) {
 	return dec.header, dec.readOSMHeader()
 }
 
+type OsmRawProcessor func(objects []interface{}, err error)
+
 // Start decoding process using n goroutines.
 func (dec *Decoder) Start(n int) error {
-	if n < 1 {
+
+	useProcessors := false
+	if len(dec.processors) > 0 {
+		useProcessors = true
+		n = len(dec.processors)
+	} else if n < 1 {
 		n = 1
 	}
 
@@ -201,9 +215,11 @@ func (dec *Decoder) Start(n int) error {
 		input := make(chan resultWithOffset)
 		output := make(chan pair)
 
-		workerState := &workerState{}
+		workerState := &workerState{
+			processor: dec.processors[i],
+		}
 		dec.workerStates = append(dec.workerStates, workerState)
-
+		dec.wg.Add(1)
 		go func() {
 			dd := new(dataDecoder)
 			for p := range input {
@@ -213,33 +229,46 @@ func (dec *Decoder) Start(n int) error {
 					for _, o := range objects {
 						switch o.(type) {
 						case *Node:
-							workerState.nodes++
-							if workerState.firstNodeOffset == 0 || p.offset < workerState.firstNodeOffset {
-								workerState.firstNodeOffset = p.offset
+							workerState.Nodes++
+							if workerState.FirstNodeOffset == 0 || p.offset < workerState.FirstNodeOffset {
+								workerState.FirstNodeOffset = p.offset
 							}
 						case *Way:
-							workerState.ways++
-							if workerState.firstWayOffset == 0 || p.offset < workerState.firstWayOffset {
-								workerState.firstWayOffset = p.offset
+							workerState.Ways++
+							if workerState.FirstWayOffset == 0 || p.offset < workerState.FirstWayOffset {
+								workerState.FirstWayOffset = p.offset
 							}
 						case *Relation:
-							workerState.relations++
-							if workerState.firstRelationOffset == 0 || p.offset < workerState.firstRelationOffset {
-								workerState.firstRelationOffset = p.offset
+							workerState.Relations++
+							if workerState.FirstRelationOffset == 0 || p.offset < workerState.FirstRelationOffset {
+								workerState.FirstRelationOffset = p.offset
 							}
 						}
 					}
-					output <- pair{objects, err}
+					if useProcessors {
+						workerState.processor(objects, err)
+					} else {
+						output <- pair{objects, err}
+					}
 				} else {
 					// send input error as is
-					output <- pair{nil, p.pair.e}
+					if useProcessors {
+						workerState.processor(nil, p.pair.e)
+					} else {
+						output <- pair{nil, p.pair.e}
+					}
 				}
 			}
+			dec.wg.Done()
 			close(output)
 		}()
 
 		dec.inputs = append(dec.inputs, input)
 		dec.outputs = append(dec.outputs, output)
+	}
+
+	if !useProcessors {
+		return nil
 	}
 
 	// start reading OSMData
@@ -467,7 +496,7 @@ func (dec *Decoder) decodeOSMHeader(blob *OSMPBF.Blob) error {
 func (dec *Decoder) NodeCount() int64 {
 	out := int64(0)
 	for _, state := range dec.workerStates {
-		out += state.nodes
+		out += state.Nodes
 	}
 	return out
 }
@@ -475,7 +504,7 @@ func (dec *Decoder) NodeCount() int64 {
 func (dec *Decoder) WayCount() int64 {
 	out := int64(0)
 	for _, state := range dec.workerStates {
-		out += state.ways
+		out += state.Ways
 	}
 	return out
 }
@@ -483,7 +512,7 @@ func (dec *Decoder) WayCount() int64 {
 func (dec *Decoder) RelationCount() int64 {
 	out := int64(0)
 	for _, state := range dec.workerStates {
-		out += state.relations
+		out += state.Relations
 	}
 	return out
 }
@@ -491,8 +520,8 @@ func (dec *Decoder) RelationCount() int64 {
 func (dec *Decoder) FirstNodeOffset() int64 {
 	out := int64(0)
 	for _, state := range dec.workerStates {
-		if out == 0 || state.firstNodeOffset < out {
-			out = state.firstNodeOffset
+		if out == 0 || state.FirstNodeOffset < out {
+			out = state.FirstNodeOffset
 		}
 	}
 	return out
@@ -501,18 +530,37 @@ func (dec *Decoder) FirstNodeOffset() int64 {
 func (dec *Decoder) FirstWayOffset() int64 {
 	out := int64(0)
 	for _, state := range dec.workerStates {
-		if out == 0 || state.firstWayOffset < out {
-			out = state.firstWayOffset
+		if out == 0 || state.FirstWayOffset < out {
+			out = state.FirstWayOffset
 		}
 	}
 	return out
 }
+
 func (dec *Decoder) FirstRelationOffset() int64 {
 	out := int64(0)
 	for _, state := range dec.workerStates {
-		if out == 0 || state.firstRelationOffset < out {
-			out = state.firstRelationOffset
+		if out == 0 || state.FirstRelationOffset < out {
+			out = state.FirstRelationOffset
 		}
 	}
 	return out
+}
+
+func (dec *Decoder) PbfIndex() PbfIndex {
+	return PbfIndex{
+		Nodes:               dec.NodeCount(),
+		Ways:                dec.WayCount(),
+		Relations:           dec.RelationCount(),
+		FirstNodeOffset:     dec.FirstNodeOffset(),
+		FirstWayOffset:      dec.FirstWayOffset(),
+		FirstRelationOffset: dec.FirstRelationOffset(),
+	}
+}
+
+func (dec *Decoder) Wait() {
+	if len(dec.processors) == 0 {
+		panic("Can only wait if processors are provided")
+	}
+	dec.wg.Wait()
 }
